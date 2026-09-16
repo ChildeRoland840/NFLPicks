@@ -1,0 +1,1135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NFL War Room</title>
+<style>html,body{margin:0;padding:0;background:#0A0E17;}</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+
+const {useState, useEffect, useRef, useCallback} = React;
+function _ico(children){
+  return function(props){
+    const p = props || {};
+    const {size=16, color="currentColor", className, style, ...rest} = p;
+    return React.createElement('svg', {width:size, height:size, viewBox:"0 0 24 24", fill:"none", stroke:color, strokeWidth:2, strokeLinecap:"round", strokeLinejoin:"round", className, style, ...rest}, children);
+  };
+}
+const _P = (d)=>React.createElement('path',{d,key:d});
+const _C = (cx,cy,r)=>React.createElement('circle',{cx,cy,r,key:'c'+cx+cy});
+const _L = (x1,y1,x2,y2)=>React.createElement('line',{x1,y1,x2,y2,key:'l'+x1+y1+x2+y2});
+const ChevronLeft  = _ico([_P("M15 18l-6-6 6-6")]);
+const ChevronRight = _ico([_P("M9 18l6-6-6-6")]);
+const ChevronDown  = _ico([_P("M6 9l6 6 6-6")]);
+const RefreshCw    = _ico([_P("M23 4v6h-6"),_P("M1 20v-6h6"),_P("M3.51 9a9 9 0 0 1 14.85-3.36L23 10"),_P("M1 14l4.64 4.36A9 9 0 0 0 20.49 15")]);
+const Zap          = _ico([_P("M13 2L3 14h9l-1 8 10-12h-9l1-8z")]);
+const AlertTriangle= _ico([_P("M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"),_L(12,9,12,13),_L(12,17,12.01,17)]);
+const Info         = _ico([_C(12,12,10),_L(12,16,12,12),_L(12,8,12.01,8)]);
+
+
+/* =========================================================================
+   NFL WAR ROOM — a personal pick'em prediction engine
+   Data: ESPN public API (site.api.espn.com). No key required.
+   Models: Elo · Vegas · ESPN FPI · Net Rating · Pythagorean · Form · Win%
+   Consensus is weighted by each model's walk-forward backtest of last season.
+   ========================================================================= */
+
+/* ---------- theme ---------- */
+const T = {
+  bg: "#0A0E17", panel: "#121826", panel2: "#182031", border: "#263149",
+  line: "#1E2740", text: "#EAEEF7", sub: "#9AA5BC", faint: "#5C6884",
+  gold: "#E4B24A",
+};
+const TIERS = {
+  lock:   { c: "#2FBF71", label: "LOCK" },
+  strong: { c: "#59B96A", label: "STRONG" },
+  lean:   { c: "#E0A72E", label: "LEAN" },
+  coin:   { c: "#D96A5B", label: "COIN FLIP" },
+};
+function tierFor(prob) {
+  const w = Math.max(prob, 1 - prob);
+  if (w >= 0.72) return TIERS.lock;
+  if (w >= 0.63) return TIERS.strong;
+  if (w >= 0.56) return TIERS.lean;
+  return TIERS.coin;
+}
+
+/* ---------- math ---------- */
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+function erf(x) {
+  const t = 1 / (1 + 0.3275911 * Math.abs(x));
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return x >= 0 ? y : -y;
+}
+const normCdf = (x) => 0.5 * (1 + erf(x / Math.SQRT2));
+const probFromMargin = (m) => clamp(normCdf(m / 13.5), 0.02, 0.98);
+const HFA = 48;      // Elo home-field bonus
+const HFA_PTS = 1.9; // point-based home edge
+const eloProb = (rH, rA) => 1 / (1 + Math.pow(10, ((rA) - (rH + HFA)) / 400));
+function log5(pa, pb) {
+  const d = pa + pb - 2 * pa * pb;
+  if (Math.abs(d) < 1e-9) return 0.5;
+  return clamp((pa - pa * pb) / d, 0.02, 0.98);
+}
+function mlToProb(ml) {
+  if (!isFinite(ml)) return null;
+  return ml < 0 ? -ml / (-ml + 100) : 100 / (ml + 100);
+}
+const pyth = (pf, pa) => (pf + pa <= 0 ? 0.5 : Math.pow(pf, 2.37) / (Math.pow(pf, 2.37) + Math.pow(pa, 2.37)));
+
+/* ---------- ESPN fetch helpers ---------- */
+const API = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
+async function j(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+async function fetchWeek(year, seasontype, week) {
+  try {
+    const d = await j(`${API}/scoreboard?year=${year}&seasontype=${seasontype}&week=${week}`);
+    return d.events || [];
+  } catch { return []; }
+}
+async function fetchSummaryProb(eventId) {
+  try {
+    const d = await j(`${API}/summary?event=${eventId}`);
+    const g = d?.predictor?.homeTeam?.gameProjection;
+    const v = parseFloat(g);
+    return isFinite(v) ? v / 100 : null;
+  } catch { return null; }
+}
+/* small concurrency runner with progress */
+async function runTasks(tasks, onProg, concurrency = 8) {
+  const results = new Array(tasks.length);
+  let i = 0, done = 0;
+  async function worker() {
+    while (i < tasks.length) {
+      const idx = i++;
+      results[idx] = await tasks[idx]();
+      done++;
+      onProg && onProg(done, tasks.length);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+  return results;
+}
+
+/* ---------- normalize a scoreboard event ---------- */
+function parseEvent(ev) {
+  const comp = ev.competitions?.[0];
+  if (!comp) return null;
+  const cs = comp.competitors || [];
+  const home = cs.find((c) => c.homeAway === "home");
+  const away = cs.find((c) => c.homeAway === "away");
+  if (!home || !away) return null;
+  const teamInfo = (c) => ({
+    id: c.team?.id,
+    abbr: c.team?.abbreviation || "?",
+    name: c.team?.shortDisplayName || c.team?.displayName || "?",
+    full: c.team?.displayName || "",
+    logo: c.team?.logo || c.team?.logos?.[0]?.href || "",
+    color: c.team?.color ? "#" + c.team.color : T.faint,
+    score: c.score != null ? parseInt(c.score, 10) : null,
+    winner: !!c.winner,
+  });
+  const H = teamInfo(home), A = teamInfo(away);
+  const status = comp.status?.type || ev.status?.type || {};
+  // odds
+  let market = null, spreadTxt = null, ou = null, vegasHomeMargin = null;
+  const o = comp.odds?.[0];
+  if (o) {
+    ou = o.overUnder ?? null;
+    spreadTxt = o.details || (isFinite(o.spread) ? String(o.spread) : null);
+    // spread -> home predicted margin (positive = home favored)
+    if (o.details) {
+      const m = o.details.match(/([A-Z]{2,4})\s+(-?\d+(?:\.\d+)?)/);
+      if (m) {
+        const favBy = Math.abs(parseFloat(m[2]));
+        vegasHomeMargin = m[1] === H.abbr ? favBy : -favBy;
+      }
+    }
+    if (vegasHomeMargin == null && isFinite(o.spread)) vegasHomeMargin = -o.spread;
+    // market win prob: prefer de-vigged moneyline, else spread
+    const mlH = o.homeTeamOdds?.moneyLine, mlA = o.awayTeamOdds?.moneyLine;
+    const pH = mlToProb(mlH), pA = mlToProb(mlA);
+    if (pH != null && pA != null && pH + pA > 0) market = pH / (pH + pA);
+    else if (vegasHomeMargin != null) market = probFromMargin(vegasHomeMargin);
+  }
+  return {
+    id: ev.id, date: ev.date, home: H, away: A,
+    completed: !!status.completed,
+    state: status.state, // pre | in | post
+    detail: status.shortDetail || "",
+    market, spreadTxt, ou, vegasHomeMargin,
+  };
+}
+
+/* ---------- build the rating engine from history ---------- */
+function newAcc() { return { w: 0, l: 0, pf: 0, pa: 0, games: 0, marginSum: 0, oppEloSum: 0 }; }
+
+function replay(games, elo, lastAcc, curAcc, formMap, season, backtest, oddsForBacktest) {
+  // games: chronological list of {home,away, hs, as, marketHomeProb?}
+  const acc = season === "cur" ? curAcc : lastAcc;
+  for (const g of games) {
+    const hId = g.home.id, aId = g.away.id;
+    if (elo[hId] == null) elo[hId] = 1500;
+    if (elo[aId] == null) elo[aId] = 1500;
+    const rH = elo[hId], rA = elo[aId];
+
+    // ---- backtest (walk-forward) BEFORE updating state ----
+    if (backtest) {
+      const la = acc[hId], lb = acc[aId];
+      const winnerHome = g.hs > g.as;
+      const bp = {};
+      const setp = (key, p) => { if (p != null && p !== 0.5) bp[key] = p; };
+      setp("elo", eloProb(rH, rA));
+      if (la && lb && la.games >= 1 && lb.games >= 1) {
+        const rp = (x) => (x.games ? x.w / x.games : 0.5);
+        setp("record", clamp(log5(rp(la), rp(lb)) + 0.03, 0.02, 0.98));
+        const py = (x) => (x.games ? pyth(x.pf / x.games, x.pa / x.games) : 0.5);
+        setp("pyth", clamp(log5(py(la), py(lb)) + 0.03, 0.02, 0.98));
+        const net = (x) => (x.games ? x.marginSum / x.games + (x.oppEloSum / x.games - 1500) / 25 : 0);
+        setp("net", probFromMargin(net(la) - net(lb) + HFA_PTS));
+        const fm = (id) => { const arr = (formMap[id] || []).slice(-4); return arr.length ? arr.filter(Boolean).length / arr.length : 0.5; };
+        setp("form", clamp(log5(fm(hId), fm(aId)) + 0.02, 0.02, 0.98));
+      }
+      if (oddsForBacktest && g.marketHomeProb != null) setp("market", g.marketHomeProb);
+      for (const k in bp) {
+        if (!backtest[k]) backtest[k] = { correct: 0, total: 0 };
+        backtest[k].total++;
+        if ((bp[k] > 0.5) === winnerHome) backtest[k].correct++;
+      }
+      let num = 0, den = 0;
+      for (const k in bp) { num += DEFAULT_W[k] * bp[k]; den += DEFAULT_W[k]; }
+      if (den > 0) {
+        const ep = num / den, ok = (ep > 0.5) === winnerHome;
+        if (!backtest.ensemble) backtest.ensemble = { correct: 0, total: 0 };
+        backtest.ensemble.total++; if (ok) backtest.ensemble.correct++;
+        const wk = g.ord;
+        if (!backtest.byWeek) backtest.byWeek = {};
+        if (!backtest.byWeek[wk]) backtest.byWeek[wk] = { correct: 0, total: 0 };
+        backtest.byWeek[wk].total++; if (ok) backtest.byWeek[wk].correct++;
+      }
+    }
+
+    // ---- Elo update (margin-of-victory) ----
+    const exp = eloProb(rH, rA);
+    const margin = g.hs - g.as;
+    const resHome = margin > 0 ? 1 : margin < 0 ? 0 : 0.5;
+    const adjH = rH + HFA, adjA = rA;
+    const eloDiffWinner = resHome === 1 ? adjH - adjA : adjA - adjH;
+    const movMult = Math.log(Math.abs(margin) + 1) * (2.2 / (eloDiffWinner * 0.001 + 2.2));
+    const K = 20;
+    const delta = K * movMult * (resHome - exp);
+    elo[hId] = rH + delta;
+    elo[aId] = rA - delta;
+
+    // ---- rolling accumulators ----
+    for (const [t, opp, sf, sa, oppElo] of [
+      [hId, aId, g.hs, g.as, rA],
+      [aId, hId, g.as, g.hs, rH],
+    ]) {
+      if (!acc[t]) acc[t] = newAcc();
+      const a = acc[t];
+      const won = sf > sa;
+      a.games++; a.pf += sf; a.pa += sa; a.marginSum += sf - sa; a.oppEloSum += oppElo;
+      if (won) a.w++; else if (sf < sa) a.l++;
+      if (!formMap[t]) formMap[t] = [];
+      formMap[t].push(won ? 1 : 0);
+    }
+  }
+}
+
+function blend(cur, last, pickCur, pickLast, neutral) {
+  const cg = cur ? cur.games : 0;
+  if (cg >= 4) return pickCur(cur);
+  const lastVal = last && last.games ? pickLast(last) : neutral;
+  if (cg > 0) { const wc = cg / 4; return wc * pickCur(cur) + (1 - wc) * lastVal; }
+  return lastVal;
+}
+
+function buildEffStats(meta, lastAcc, curAcc, formMap) {
+  const eff = {};
+  for (const id of Object.keys(meta)) {
+    const cur = curAcc[id], last = lastAcc[id];
+    const recordPct = blend(cur, last,
+      (x) => x.w / x.games, (x) => x.w / x.games, 0.5);
+    const avgPf = blend(cur, last, (x) => x.pf / x.games, (x) => x.pf / x.games, 21);
+    const avgPa = blend(cur, last, (x) => x.pa / x.games, (x) => x.pa / x.games, 21);
+    const avgMargin = blend(cur, last, (x) => x.marginSum / x.games, (x) => x.marginSum / x.games, 0);
+    const avgOpp = blend(cur, last, (x) => x.oppEloSum / x.games, (x) => x.oppEloSum / x.games, 1500);
+    const arr = formMap[id] || [];
+    const last4 = arr.slice(-4);
+    const form = last4.length ? last4.filter(Boolean).length / last4.length : 0.5;
+    eff[id] = {
+      recordPct, pyth: pyth(avgPf, avgPa), form,
+      net: avgMargin + (avgOpp - 1500) / 25,
+    };
+  }
+  return eff;
+}
+
+/* ---------- model definitions ---------- */
+const MODELS = [
+  { key: "market", label: "Vegas Line", short: "VEG" },
+  { key: "espn", label: "ESPN FPI", short: "FPI" },
+  { key: "elo", label: "Elo Rating", short: "ELO" },
+  { key: "net", label: "Net Rating", short: "NET" },
+  { key: "pyth", label: "Pythagorean", short: "PYT" },
+  { key: "form", label: "Recent Form", short: "FRM" },
+  { key: "record", label: "Win %", short: "W-L" },
+];
+const DEFAULT_W = { market: 0.09, espn: 0.08, elo: 0.075, net: 0.055, pyth: 0.05, form: 0.035, record: 0.025 };
+
+function computeWeights(backtest) {
+  const w = {};
+  const bt = {};
+  for (const m of MODELS) {
+    const b = backtest[m.key];
+    if (b && b.total >= 25) {
+      const acc = b.correct / b.total;
+      bt[m.key] = acc;
+      w[m.key] = Math.max(0.01, acc - 0.5);
+    } else {
+      w[m.key] = DEFAULT_W[m.key];
+    }
+  }
+  // ESPN FPI isn't historically backtestable here → give it Elo-class weight
+  if (!(backtest.espn && backtest.espn.total >= 25)) {
+    const strong = Math.max(w.elo, w.market || 0);
+    w.espn = Math.max(w.espn, strong * 0.95);
+  }
+  return { weights: w, acc: bt };
+}
+
+/* ---------- per-matchup prediction ---------- */
+function predictMatchup(engine, ev) {
+  const { elo, eff, weights } = engine;
+  const hId = ev.home.id, aId = ev.away.id;
+  const rH = elo[hId] ?? 1500, rA = elo[aId] ?? 1500;
+  const eh = eff[hId] || { recordPct: 0.5, pyth: 0.5, form: 0.5, net: 0 };
+  const ea = eff[aId] || { recordPct: 0.5, pyth: 0.5, form: 0.5, net: 0 };
+  const probs = {};
+  probs.elo = eloProb(rH, rA);
+  probs.record = clamp(log5(eh.recordPct, ea.recordPct) + 0.03, 0.02, 0.98);
+  probs.pyth = clamp(log5(eh.pyth, ea.pyth) + 0.03, 0.02, 0.98);
+  probs.form = clamp(log5(eh.form, ea.form) + 0.02, 0.02, 0.98);
+  probs.net = probFromMargin(eh.net - ea.net + HFA_PTS);
+  if (ev.market != null) probs.market = ev.market;
+  if (ev.espn != null) probs.espn = ev.espn;
+
+  let num = 0, den = 0;
+  for (const m of MODELS) {
+    if (probs[m.key] != null) { num += weights[m.key] * probs[m.key]; den += weights[m.key]; }
+  }
+  const ensemble = den > 0 ? num / den : 0.5;
+  const agree = MODELS.filter((m) => probs[m.key] != null && (probs[m.key] > 0.5) === (ensemble > 0.5)).length;
+  const total = MODELS.filter((m) => probs[m.key] != null).length;
+
+  // ---- against the spread ----
+  const modelSpreadHome = ((rH + HFA - rA) / 25 + (eh.net - ea.net + HFA_PTS)) / 2;
+  let ats = null;
+  if (ev.vegasHomeMargin != null) {
+    const edge = modelSpreadHome - ev.vegasHomeMargin;
+    const sideIsHome = edge > 0;
+    ats = { modelSpreadHome, vegasHomeMargin: ev.vegasHomeMargin, edge, side: sideIsHome ? ev.home : ev.away, sideIsHome };
+  }
+
+  // ---- upset detection ----
+  const favIsHome = ev.market != null ? ev.market >= 0.5 : ensemble >= 0.5;
+  const dogIsHome = !favIsHome;
+  const dogTeam = dogIsHome ? ev.home : ev.away;
+  const favTeam = dogIsHome ? ev.away : ev.home;
+  const dogProb = dogIsHome ? ensemble : 1 - ensemble;
+  const modelPicksDog = (ensemble >= 0.5) === dogIsHome;
+  const dogForm = dogIsHome ? eh.form : ea.form;
+  const favForm = dogIsHome ? ea.form : eh.form;
+  const signals = [];
+  let upsetScore = dogProb;
+  if (modelPicksDog) { upsetScore += 0.10; signals.push("Consensus takes the underdog outright"); }
+  if (dogForm - favForm >= 0.25) { upsetScore += 0.05; signals.push("Underdog is in hotter recent form"); }
+  if (total >= 3 && agree <= Math.ceil(total * 0.6)) { upsetScore += 0.05; signals.push("The models are split on this one"); }
+  if (ats && ats.sideIsHome === dogIsHome && Math.abs(ats.edge) >= 2.5) {
+    upsetScore += 0.05; signals.push(`Model sees ${Math.abs(ats.edge).toFixed(1)} pts of spread value on the dog`);
+  }
+  let upsetTier = null;
+  if (ev.market != null || total >= 3) {
+    if (modelPicksDog) upsetTier = "pick";
+    else if (dogProb >= 0.40) upsetTier = "alert";
+  }
+
+  return { ...ev, probs, ensemble, agree, totalModels: total, ats, dogTeam, favTeam, dogProb, dogIsHome, modelPicksDog, upsetScore, signals, upsetTier };
+}
+
+/* =========================================================================
+   COMPONENT
+   ========================================================================= */
+function App() {
+  const [status, setStatus] = useState("loading");
+  const [prog, setProg] = useState({ done: 0, total: 1, label: "Waking up the war room" });
+  const [err, setErr] = useState("");
+  const [view, setView] = useState("slate");
+  const [week, setWeek] = useState(1);
+  const [year, setYear] = useState(null);
+  const [games, setGames] = useState([]);
+  const [expanded, setExpanded] = useState(null);
+  const [loadingWeek, setLoadingWeek] = useState(false);
+  const [showHow, setShowHow] = useState(false);
+  const engineRef = useRef(null);
+
+  /* build engine once */
+  const buildEngine = useCallback(async () => {
+    setStatus("loading");
+    setErr("");
+    try {
+      setProg({ done: 0, total: 1, label: "Finding the current week" });
+      const bare = await j(`${API}/scoreboard`);
+      const curYear = bare?.season?.year || new Date().getFullYear();
+      const curType = bare?.season?.type || 2;
+      const curWeek = bare?.week?.number || 1;
+      const lastYear = curYear - 1;
+      // what week do we predict by default?
+      const predictType = 2;
+      const defaultWeek = curType === 2 ? curWeek : 1;
+      const completedCurWeeks = curType === 2 ? Math.max(0, curWeek) : 0;
+      setYear(curYear);
+      setWeek(defaultWeek);
+
+      // ---- assemble history fetch tasks ----
+      const tasks = [];
+      const tags = [];
+      for (let wk = 1; wk <= 18; wk++) { tasks.push(() => fetchWeek(lastYear, 2, wk)); tags.push({ season: "last", ord: wk }); }
+      for (let wk = 1; wk <= 5; wk++)  { tasks.push(() => fetchWeek(lastYear, 3, wk)); tags.push({ season: "last", ord: 100 + wk }); }
+      for (let wk = 1; wk <= completedCurWeeks; wk++) { tasks.push(() => fetchWeek(curYear, 2, wk)); tags.push({ season: "cur", ord: wk }); }
+
+      setProg({ done: 0, total: tasks.length, label: "Pulling game history" });
+      const res = await runTasks(tasks, (d, t) => setProg({ done: d, total: t, label: "Pulling game history" }));
+
+      // ---- parse into chronological completed games, collect team meta ----
+      const meta = {};
+      const lastGames = [], curGames = [];
+      let histOddsCount = 0;
+      res.forEach((events, idx) => {
+        const tag = tags[idx];
+        (events || []).forEach((ev) => {
+          const p = parseEvent(ev);
+          if (!p) return;
+          [p.home, p.away].forEach((t) => {
+            if (t.id && !meta[t.id]) meta[t.id] = { abbr: t.abbr, name: t.name, full: t.full, logo: t.logo, color: t.color };
+          });
+          if (!p.completed || p.home.score == null || p.away.score == null) return;
+          const rec = {
+            date: p.date, home: p.home, away: p.away,
+            hs: p.home.score, as: p.away.score,
+            marketHomeProb: p.market,
+            ord: tag.ord,
+          };
+          if (p.market != null) histOddsCount++;
+          (tag.season === "last" ? lastGames : curGames).push(rec);
+        });
+      });
+      lastGames.sort((a, b) => new Date(a.date) - new Date(b.date) || a.ord - b.ord);
+      curGames.sort((a, b) => new Date(a.date) - new Date(b.date) || a.ord - b.ord);
+
+      if (Object.keys(meta).length < 16) throw new Error("Couldn't load enough team data from ESPN. It may be temporarily rate-limiting — try refreshing.");
+
+      // ---- run the engine ----
+      const elo = {}, lastAcc = {}, curAcc = {}, formMap = {};
+      const backtest = {};
+      replay(lastGames, elo, lastAcc, curAcc, formMap, "last", backtest, histOddsCount > 40);
+      // regress to mean between seasons
+      for (const k of Object.keys(elo)) elo[k] = 1500 + (elo[k] - 1500) * 0.75;
+      // current-season games update ratings and track this year's record
+      const curBt = {};
+      replay(curGames, elo, lastAcc, curAcc, formMap, "cur", curBt, histOddsCount > 40);
+
+      const eff = buildEffStats(meta, lastAcc, curAcc, formMap);
+      const { weights, acc } = computeWeights(backtest);
+
+      // records for display (current season if available, else last season)
+      const recFor = (id) => {
+        const c = curAcc[id], l = lastAcc[id];
+        if (c && c.games) return { w: c.w, l: c.l, tag: "" };
+        if (l && l.games) return { w: l.w, l: l.l, tag: "'" + String(lastYear).slice(2) };
+        return { w: 0, l: 0, tag: "" };
+      };
+
+      engineRef.current = {
+        curYear, lastYear, elo, eff, weights, acc, meta, backtest, curBt,
+        formMap, lastAcc, curAcc, recFor, histOdds: histOddsCount > 40,
+      };
+      setStatus("ready");
+      await loadWeek(defaultWeek, curYear);
+    } catch (e) {
+      setErr(e.message || "Something went wrong talking to ESPN.");
+      setStatus("error");
+    }
+  }, []);
+
+  /* load a single week's matchups + predictions */
+  const loadWeek = useCallback(async (wk, yr) => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    const useYear = yr || engine.curYear;
+    setLoadingWeek(true);
+    try {
+      const events = await fetchWeek(useYear, 2, wk);
+      const parsed = events.map(parseEvent).filter(Boolean);
+      // ESPN FPI projections per game (tolerant)
+      const espnProbs = await runTasks(
+        parsed.map((p) => () => fetchSummaryProb(p.id)),
+        null, 6
+      );
+      parsed.forEach((p, i) => { p.espn = espnProbs[i]; });
+      const preds = parsed.map((p) => predictMatchup(engine, p));
+      preds.sort((a, b) => Math.max(b.ensemble, 1 - b.ensemble) - Math.max(a.ensemble, 1 - a.ensemble));
+      setGames(preds);
+      setExpanded(null);
+    } catch {
+      setGames([]);
+    } finally {
+      setLoadingWeek(false);
+    }
+  }, []);
+
+  useEffect(() => { buildEngine(); }, [buildEngine]);
+
+  const changeWeek = (wk) => {
+    if (wk < 1 || wk > 18 || loadingWeek) return;
+    setWeek(wk);
+    loadWeek(wk, year);
+  };
+
+  /* ---------------- render ---------------- */
+  if (status === "loading") return <Loader prog={prog} />;
+  if (status === "error") return <ErrorState msg={err} retry={buildEngine} />;
+
+  const engine = engineRef.current;
+
+  return (
+    <div style={{ background: T.bg, minHeight: "100vh", color: T.text, fontFamily: "Inter, system-ui, sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+        * { box-sizing: border-box; }
+        ::-webkit-scrollbar { height: 8px; width: 8px; }
+        ::-webkit-scrollbar-thumb { background: ${T.border}; border-radius: 4px; }
+        .cond { font-family: 'Saira Condensed', sans-serif; }
+        .tnum { font-variant-numeric: tabular-nums; }
+        .hoverable { transition: background .12s ease, border-color .12s ease; }
+        .hoverable:hover { background: ${T.panel2}; }
+        button { cursor: pointer; font-family: inherit; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+      `}</style>
+
+      <div style={{ maxWidth: 940, margin: "0 auto", padding: "0 14px 64px" }}>
+        <TopBar
+          week={week} year={year} onWeek={changeWeek} loading={loadingWeek}
+          onRefresh={() => buildEngine()} histOdds={engine.histOdds}
+        />
+        <Segmented view={view} setView={setView} />
+
+        {view === "slate" && (
+          <Slate games={games} engine={engine} expanded={expanded} setExpanded={setExpanded} loading={loadingWeek} />
+        )}
+        {view === "upsets" && <Upsets games={games} loading={loadingWeek} />}
+        {view === "rankings" && <Rankings engine={engine} />}
+        {view === "matrix" && <Matrix games={games} engine={engine} loading={loadingWeek} />}
+        {view === "record" && <TrackRecord engine={engine} />}
+
+        <HowItWorks open={showHow} toggle={() => setShowHow((s) => !s)} engine={engine} />
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Top bar ---------------- */
+function TopBar({ week, year, onWeek, loading, onRefresh, histOdds }) {
+  return (
+    <header style={{ position: "sticky", top: 0, zIndex: 10, background: T.bg, paddingTop: 16, paddingBottom: 10, borderBottom: `1px solid ${T.line}` }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+          <span className="cond" style={{ fontSize: 26, fontWeight: 700, letterSpacing: 0.5 }}>
+            WAR <span style={{ color: T.gold }}>ROOM</span>
+          </span>
+          <span style={{ color: T.faint, fontSize: 12 }}>NFL pick&apos;em intelligence</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 4, background: T.panel, border: `1px solid ${T.border}`, borderRadius: 8, padding: "3px 4px" }}>
+            <IconBtn onClick={() => onWeek(week - 1)} disabled={week <= 1 || loading}><ChevronLeft size={16} /></IconBtn>
+            <span className="cond" style={{ minWidth: 92, textAlign: "center", fontSize: 15, fontWeight: 600 }}>
+              WEEK {week} · {year}
+            </span>
+            <IconBtn onClick={() => onWeek(week + 1)} disabled={week >= 18 || loading}><ChevronRight size={16} /></IconBtn>
+          </div>
+          <IconBtn onClick={onRefresh} title="Rebuild ratings from ESPN">
+            <RefreshCw size={16} className={loading ? "" : ""} style={loading ? { animation: "spin 1s linear infinite" } : {}} />
+          </IconBtn>
+        </div>
+      </div>
+      {!histOdds && (
+        <div style={{ marginTop: 6, fontSize: 11, color: T.faint }}>
+          Historical betting lines were sparse — the Vegas model runs on live lines only and uses a default weight.
+        </div>
+      )}
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    </header>
+  );
+}
+function IconBtn({ children, ...p }) {
+  return (
+    <button {...p} style={{ background: "transparent", border: "none", color: p.disabled ? T.faint : T.sub, padding: 4, display: "grid", placeItems: "center", opacity: p.disabled ? 0.4 : 1 }}>
+      {children}
+    </button>
+  );
+}
+
+/* ---------------- Segmented control ---------------- */
+function Segmented({ view, setView }) {
+  const items = [["slate", "Slate"], ["upsets", "Upsets"], ["rankings", "Rankings"], ["matrix", "Matrix"], ["record", "Record"]];
+  return (
+    <div style={{ display: "flex", gap: 4, margin: "14px 0 4px", overflowX: "auto", paddingBottom: 1 }}>
+      {items.map(([k, label]) => (
+        <button key={k} onClick={() => setView(k)} className="cond"
+          style={{
+            flex: "1 0 auto", minWidth: 76, padding: "9px 10px", fontSize: 14, fontWeight: 600, letterSpacing: 0.4,
+            color: view === k ? T.text : T.sub, background: view === k ? T.panel2 : "transparent",
+            border: `1px solid ${view === k ? T.border : "transparent"}`,
+            borderBottom: `2px solid ${view === k ? T.gold : T.line}`, borderRadius: "8px 8px 0 0", whiteSpace: "nowrap",
+          }}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- Slate ---------------- */
+function Slate({ games, engine, expanded, setExpanded, loading }) {
+  if (loading) return <WeekSkeleton />;
+  if (!games.length) return <Empty msg="No games found for this week yet. ESPN may not have posted the schedule — try another week." />;
+  const top = games[0];
+  const n = games.length;
+  return (
+    <div>
+      <LockSpotlight g={top} engine={engine} />
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", margin: "18px 2px 8px" }}>
+        <span className="cond" style={{ fontSize: 15, color: T.sub, fontWeight: 600 }}>RANKED BY CONFIDENCE</span>
+        <span style={{ fontSize: 11, color: T.faint }}>points = confidence-pool suggestion</span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {games.map((g, i) => (
+          <GameRow key={g.id} g={g} rank={i + 1} points={n - i} engine={engine}
+            open={expanded === g.id} onToggle={() => setExpanded(expanded === g.id ? null : g.id)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function pickSide(g) {
+  const homePick = g.ensemble >= 0.5;
+  const team = homePick ? g.home : g.away;
+  const prob = homePick ? g.ensemble : 1 - g.ensemble;
+  const opp = homePick ? g.away : g.home;
+  return { team, opp, prob, homePick };
+}
+function fmtKick(iso) {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString(undefined, { weekday: "short" }) + " " +
+      d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  } catch { return ""; }
+}
+
+function LockSpotlight({ g, engine }) {
+  const { team, opp, prob } = pickSide(g);
+  const tier = tierFor(g.ensemble);
+  return (
+    <div style={{ background: `linear-gradient(135deg, ${T.panel2}, ${T.panel})`, border: `1px solid ${T.border}`, borderLeft: `3px solid ${tier.c}`, borderRadius: 12, padding: "16px 18px", marginTop: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <Zap size={14} color={T.gold} />
+        <span className="cond" style={{ fontSize: 13, letterSpacing: 1, color: T.gold, fontWeight: 700 }}>BEST BET OF THE WEEK</span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+        <Logo t={team} size={44} />
+        <div style={{ flex: 1, minWidth: 160 }}>
+          <div className="cond" style={{ fontSize: 30, fontWeight: 700, lineHeight: 1 }}>
+            {team.name} <span style={{ color: T.faint, fontSize: 18, fontWeight: 500 }}>over {opp.name}</span>
+          </div>
+          <div style={{ color: T.sub, fontSize: 12, marginTop: 6 }}>
+            {g.agree}/{g.totalModels} models agree · {fmtKick(g.date)} {g.spreadTxt ? "· line " + g.spreadTxt : ""}
+          </div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div className="cond tnum" style={{ fontSize: 44, fontWeight: 700, color: tier.c, lineHeight: 1 }}>
+            {Math.round(prob * 100)}<span style={{ fontSize: 20 }}>%</span>
+          </div>
+          <div className="cond" style={{ fontSize: 12, letterSpacing: 1, color: tier.c }}>{tier.label}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GameRow({ g, rank, points, engine, open, onToggle }) {
+  const { team, opp, prob, homePick } = pickSide(g);
+  const tier = tierFor(g.ensemble);
+  const wrong = g.completed && ((g.home.winner) !== homePick);
+  const right = g.completed && ((g.home.winner) === homePick);
+  return (
+    <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 10, overflow: "hidden" }}>
+      <button onClick={onToggle} className="hoverable" style={{ width: "100%", background: "transparent", border: "none", color: T.text, textAlign: "left", padding: "10px 12px", display: "flex", alignItems: "center", gap: 12 }}>
+        <span className="cond tnum" style={{ width: 22, textAlign: "center", color: T.faint, fontSize: 16 }}>{rank}</span>
+        <div style={{ width: 6, height: 34, borderRadius: 3, background: tier.c, flexShrink: 0 }} />
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
+          <Logo t={team} size={26} />
+          <div style={{ minWidth: 0 }}>
+            <div className="cond" style={{ fontSize: 17, fontWeight: 600, lineHeight: 1.05, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {team.abbr} <span style={{ color: T.faint, fontWeight: 400, fontSize: 13 }}>vs {opp.abbr}</span>
+            </div>
+            <div style={{ fontSize: 11, color: T.faint, display: "flex", alignItems: "center", gap: 6 }}>
+              {!g.completed && g.upsetTier && <UpsetChip tier={g.upsetTier} small />}
+              {g.completed
+                ? <span style={{ color: right ? TIERS.lock.c : TIERS.coin.c }}>
+                    {right ? "✓ hit" : "✗ miss"} · {g.away.abbr} {g.away.score}–{g.home.score} {g.home.abbr}
+                  </span>
+                : <span>{g.agree}/{g.totalModels} agree · {fmtKick(g.date)}</span>}
+            </div>
+          </div>
+        </div>
+        <div style={{ textAlign: "right", marginRight: 4 }}>
+          <div className="cond tnum" style={{ fontSize: 20, fontWeight: 700, color: tier.c, lineHeight: 1 }}>{Math.round(prob * 100)}%</div>
+          <div style={{ fontSize: 10, color: T.faint }}>{tier.label}</div>
+        </div>
+        <div style={{ textAlign: "center", background: T.bg, border: `1px solid ${T.border}`, borderRadius: 6, padding: "3px 7px", minWidth: 34 }}>
+          <div className="cond tnum" style={{ fontSize: 16, fontWeight: 700, color: T.gold, lineHeight: 1 }}>{points}</div>
+          <div style={{ fontSize: 8, color: T.faint }}>PTS</div>
+        </div>
+        <ChevronDown size={16} color={T.faint} style={{ transform: open ? "rotate(180deg)" : "none", transition: "transform .15s", flexShrink: 0 }} />
+      </button>
+      {open && <ModelBreakdown g={g} engine={engine} />}
+    </div>
+  );
+}
+
+function ModelBreakdown({ g, engine }) {
+  return (
+    <div style={{ borderTop: `1px solid ${T.line}`, padding: "12px 12px 14px", background: T.bg }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 8 }}>
+        {MODELS.map((m) => {
+          const p = g.probs[m.key];
+          if (p == null) return (
+            <div key={m.key} style={{ padding: "7px 9px", background: T.panel, border: `1px solid ${T.line}`, borderRadius: 7, opacity: 0.5 }}>
+              <div style={{ fontSize: 11, color: T.faint }}>{m.label}</div>
+              <div style={{ fontSize: 12, color: T.faint }}>no data</div>
+            </div>
+          );
+          const homePick = p >= 0.5;
+          const side = homePick ? g.home.abbr : g.away.abbr;
+          const conf = Math.round(Math.max(p, 1 - p) * 100);
+          const t = tierFor(p);
+          const wt = engine.weights[m.key];
+          const totW = MODELS.reduce((s, mm) => s + (g.probs[mm.key] != null ? engine.weights[mm.key] : 0), 0);
+          const wpct = totW > 0 ? Math.round((wt / totW) * 100) : 0;
+          return (
+            <div key={m.key} style={{ padding: "7px 9px", background: T.panel, border: `1px solid ${T.border}`, borderRadius: 7 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                <span style={{ fontSize: 11, color: T.sub }}>{m.label}</span>
+                <span style={{ fontSize: 9, color: T.faint }}>{wpct}% wt</span>
+              </div>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 6, marginTop: 3 }}>
+                <span className="cond" style={{ fontSize: 16, fontWeight: 600 }}>{side}</span>
+                <span className="cond tnum" style={{ fontSize: 15, fontWeight: 700, color: t.c }}>{conf}%</span>
+              </div>
+              <div style={{ height: 3, background: T.line, borderRadius: 2, marginTop: 5, overflow: "hidden" }}>
+                <div style={{ width: `${conf}%`, height: "100%", background: t.c }} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {g.ats && (
+        <div style={{ marginTop: 12, padding: "9px 11px", background: T.panel, border: `1px solid ${T.border}`, borderRadius: 7 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span className="cond" style={{ fontSize: 12, letterSpacing: 0.4, color: T.sub, fontWeight: 600 }}>AGAINST THE SPREAD</span>
+            <span style={{ fontSize: 11, color: T.faint }}>edge {Math.abs(g.ats.edge).toFixed(1)} pts</span>
+          </div>
+          <div style={{ display: "flex", gap: 16, marginTop: 6, fontSize: 12, color: T.sub, flexWrap: "wrap" }}>
+            <span>Vegas <b className="tnum" style={{ color: T.text }}>{g.home.abbr} {fmtSpread(g.ats.vegasHomeMargin)}</b></span>
+            <span>Model <b className="tnum" style={{ color: T.text }}>{g.home.abbr} {fmtSpread(g.ats.modelSpreadHome)}</b></span>
+            <span>Lean <b className="tnum" style={{ color: Math.abs(g.ats.edge) >= 1.5 ? TIERS.strong.c : T.faint }}>{g.ats.side.abbr} {fmtSpread(g.ats.sideIsHome ? g.ats.vegasHomeMargin : -g.ats.vegasHomeMargin)}</b></span>
+          </div>
+          {Math.abs(g.ats.edge) < 1.5 && <div style={{ fontSize: 10.5, color: T.faint, marginTop: 5 }}>Model agrees with the line — no real ATS edge here.</div>}
+        </div>
+      )}
+      {g.ou && <div style={{ fontSize: 11, color: T.faint, marginTop: 10 }}>Over/Under: {g.ou}</div>}
+    </div>
+  );
+}
+
+/* ---------------- Power Rankings ---------------- */
+function Rankings({ engine }) {
+  const rows = Object.keys(engine.meta).map((id) => {
+    const rec = engine.recFor(id);
+    const form = (engine.formMap[id] || []).slice(-5);
+    return {
+      id, meta: engine.meta[id], elo: engine.elo[id] ?? 1500,
+      rec, form, net: engine.eff[id]?.net ?? 0,
+    };
+  }).sort((a, b) => b.elo - a.elo);
+
+  return (
+    <div style={{ marginTop: 14, background: T.panel, border: `1px solid ${T.border}`, borderRadius: 10, overflow: "hidden" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "34px 1fr 62px 58px 58px 90px", padding: "9px 12px", borderBottom: `1px solid ${T.line}`, fontSize: 11, color: T.faint }} className="cond">
+        <span>#</span><span>TEAM</span><span style={{ textAlign: "right" }}>ELO</span>
+        <span style={{ textAlign: "right" }}>REC</span><span style={{ textAlign: "right" }}>NET</span>
+        <span style={{ textAlign: "right" }}>LAST 5</span>
+      </div>
+      {rows.map((r, i) => (
+        <div key={r.id} className="hoverable" style={{ display: "grid", gridTemplateColumns: "34px 1fr 62px 58px 58px 90px", alignItems: "center", padding: "8px 12px", borderBottom: i < rows.length - 1 ? `1px solid ${T.line}` : "none" }}>
+          <span className="cond tnum" style={{ color: i < 8 ? T.gold : T.faint, fontSize: 15, fontWeight: 600 }}>{i + 1}</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+            <Logo t={r.meta} size={22} />
+            <span className="cond" style={{ fontSize: 15, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.meta.name}</span>
+          </div>
+          <span className="cond tnum" style={{ textAlign: "right", fontSize: 15, fontWeight: 600 }}>{Math.round(r.elo)}</span>
+          <span className="tnum" style={{ textAlign: "right", fontSize: 13, color: T.sub }}>{r.rec.w}-{r.rec.l}<span style={{ fontSize: 9, color: T.faint }}>{r.rec.tag}</span></span>
+          <span className="tnum" style={{ textAlign: "right", fontSize: 13, color: r.net >= 0 ? TIERS.strong.c : TIERS.coin.c }}>{r.net >= 0 ? "+" : ""}{r.net.toFixed(1)}</span>
+          <div style={{ display: "flex", gap: 3, justifyContent: "flex-end" }}>
+            {r.form.length ? r.form.map((w, k) => (
+              <span key={k} style={{ width: 12, height: 12, borderRadius: 3, background: w ? TIERS.lock.c : TIERS.coin.c, opacity: 0.85 }} title={w ? "W" : "L"} />
+            )) : <span style={{ fontSize: 11, color: T.faint }}>—</span>}
+          </div>
+        </div>
+      ))}
+      <div style={{ padding: "9px 12px", fontSize: 11, color: T.faint }}>
+        Ranked by margin-adjusted Elo, carried over from {engine.lastYear} with regression to the mean.
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Model Matrix ---------------- */
+function Matrix({ games, engine, loading }) {
+  if (loading) return <WeekSkeleton />;
+  if (!games.length) return <Empty msg="No games to compare for this week." />;
+  return (
+    <div style={{ marginTop: 14 }}>
+      <div style={{ overflowX: "auto", background: T.panel, border: `1px solid ${T.border}`, borderRadius: 10 }}>
+        <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 640 }}>
+          <thead>
+            <tr>
+              <th style={thStyle("left")}>MATCHUP</th>
+              {MODELS.map((m) => <th key={m.key} style={thStyle("center")}>{m.short}</th>)}
+              <th style={{ ...thStyle("center"), color: T.gold }}>PICK</th>
+            </tr>
+          </thead>
+          <tbody>
+            {games.map((g, i) => {
+              const cons = pickSide(g);
+              return (
+                <tr key={g.id} style={{ borderTop: `1px solid ${T.line}` }}>
+                  <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
+                    <span className="cond" style={{ fontSize: 14, fontWeight: 600 }}>{g.away.abbr}</span>
+                    <span style={{ color: T.faint, fontSize: 12 }}> @ </span>
+                    <span className="cond" style={{ fontSize: 14, fontWeight: 600 }}>{g.home.abbr}</span>
+                  </td>
+                  {MODELS.map((m) => {
+                    const p = g.probs[m.key];
+                    if (p == null) return <td key={m.key} style={{ textAlign: "center", color: T.faint, fontSize: 12 }}>—</td>;
+                    const homePick = p >= 0.5;
+                    const side = homePick ? g.home.abbr : g.away.abbr;
+                    const agrees = homePick === (g.ensemble >= 0.5);
+                    const t = tierFor(p);
+                    return (
+                      <td key={m.key} style={{ textAlign: "center", padding: "6px 6px" }}>
+                        <div className="cond" style={{ fontSize: 13, fontWeight: 600, color: agrees ? T.text : TIERS.coin.c }}>{side}</div>
+                        <div className="tnum" style={{ fontSize: 10, color: t.c }}>{Math.round(Math.max(p, 1 - p) * 100)}</div>
+                      </td>
+                    );
+                  })}
+                  <td style={{ textAlign: "center", padding: "6px 8px", background: T.panel2 }}>
+                    <div className="cond" style={{ fontSize: 14, fontWeight: 700, color: tierFor(g.ensemble).c }}>{cons.team.abbr}</div>
+                    <div className="tnum" style={{ fontSize: 10, color: T.sub }}>{Math.round(cons.prob * 100)}%</div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ fontSize: 11, color: T.faint, marginTop: 8 }}>
+        Red picks disagree with the consensus — those are your upset watch. Small number = each model&apos;s win confidence.
+      </div>
+    </div>
+  );
+}
+function thStyle(align) {
+  return { textAlign: align, padding: "9px 8px", fontSize: 11, color: T.faint, fontFamily: "'Saira Condensed',sans-serif", position: "sticky", top: 0 };
+}
+
+function AccuracyBar({ engine }) {
+  const entries = MODELS.map((m) => ({ m, acc: engine.acc[m.key] })).filter((e) => e.acc != null).sort((a, b) => b.acc - a.acc);
+  if (!entries.length) return null;
+  return (
+    <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 10, padding: "12px 14px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10 }}>
+        <span className="cond" style={{ fontSize: 13, letterSpacing: 0.5, color: T.sub, fontWeight: 600 }}>BACKTESTED ACCURACY · {engine.lastYear} SEASON</span>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px,1fr))", gap: 10 }}>
+        {entries.map(({ m, acc }) => (
+          <div key={m.key}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: T.sub, marginBottom: 3 }}>
+              <span>{m.label}</span><span className="tnum">{(acc * 100).toFixed(1)}%</span>
+            </div>
+            <div style={{ height: 4, background: T.line, borderRadius: 2, overflow: "hidden" }}>
+              <div style={{ width: `${((acc - 0.4) / 0.35) * 100}%`, height: "100%", background: acc >= 0.6 ? TIERS.lock.c : acc >= 0.55 ? TIERS.lean.c : T.faint }} />
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={{ fontSize: 10, color: T.faint, marginTop: 9 }}>Walk-forward: each pick made using only games played before it. Consensus weights each model by this.</div>
+    </div>
+  );
+}
+
+/* ---------------- Upsets ---------------- */
+function fmtSpread(margin) {
+  if (margin == null || isNaN(margin) || Math.abs(margin) < 0.05) return "PK";
+  return margin > 0 ? `-${margin.toFixed(1)}` : `+${(-margin).toFixed(1)}`;
+}
+function UpsetChip({ tier, small }) {
+  if (!tier) return null;
+  const isPick = tier === "pick";
+  const c = isPick ? TIERS.coin.c : TIERS.lean.c;
+  return (
+    <span className="cond" style={{
+      display: "inline-flex", alignItems: "center", background: c + "22", color: c,
+      border: `1px solid ${c}66`, borderRadius: 5, padding: small ? "0 5px" : "1px 8px",
+      fontSize: small ? 9.5 : 11, fontWeight: 700, letterSpacing: 0.4, whiteSpace: "nowrap",
+    }}>
+      {isPick ? "UPSET PICK" : "UPSET WATCH"}
+    </span>
+  );
+}
+
+function Upsets({ games, loading }) {
+  if (loading) return <WeekSkeleton />;
+  if (!games.length) return <Empty msg="No games loaded for this week." />;
+  const picks = games.filter((g) => g.upsetTier === "pick").sort((a, b) => b.upsetScore - a.upsetScore);
+  const alerts = games.filter((g) => g.upsetTier === "alert").sort((a, b) => b.upsetScore - a.upsetScore);
+  return (
+    <div style={{ marginTop: 14 }}>
+      <div style={{ fontSize: 12.5, color: T.sub, lineHeight: 1.55, margin: "2px 2px 14px" }}>
+        Where the family pool gets won. These are the games most likely to break against the crowd —
+        take the dogs the model believes in, and keep your big confidence points off the shaky favorites.
+      </div>
+      {picks.length > 0 && (
+        <UpsetSection title="Take the underdog" tier="pick" color={TIERS.coin.c}
+          subtitle="The consensus outright picks the team Vegas has as the underdog." games={picks} />
+      )}
+      {alerts.length > 0 && (
+        <UpsetSection title="Shaky favorites" tier="alert" color={TIERS.lean.c}
+          subtitle="Favored, but the dog has a real shot. Don't spend big confidence-pool points here." games={alerts} />
+      )}
+      {picks.length === 0 && alerts.length === 0 && (
+        <Empty msg="No strong upset signals this week — the favorites look solid. Play them straight and bank the points." />
+      )}
+    </div>
+  );
+}
+function UpsetSection({ title, subtitle, color, games, tier }) {
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "0 2px 4px" }}>
+        <AlertTriangle size={15} color={color} />
+        <span className="cond" style={{ fontSize: 17, fontWeight: 700 }}>{title}</span>
+        <UpsetChip tier={tier} />
+      </div>
+      <div style={{ fontSize: 12, color: T.sub, margin: "0 2px 10px" }}>{subtitle}</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {games.map((g) => <UpsetCard key={g.id} g={g} color={color} />)}
+      </div>
+    </div>
+  );
+}
+function UpsetCard({ g, color }) {
+  return (
+    <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderLeft: `3px solid ${color}`, borderRadius: 10, padding: "12px 14px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <Logo t={g.dogTeam} size={34} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="cond" style={{ fontSize: 19, fontWeight: 600, lineHeight: 1.05 }}>
+            {g.dogTeam.name} <span style={{ color: T.faint, fontSize: 13, fontWeight: 400 }}>over {g.favTeam.name}</span>
+          </div>
+          <div style={{ fontSize: 11, color: T.faint, marginTop: 3 }}>{fmtKick(g.date)}{g.spreadTxt ? ` · line ${g.spreadTxt}` : ""}</div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div className="cond tnum" style={{ fontSize: 24, fontWeight: 700, color, lineHeight: 1 }}>{Math.round(g.dogProb * 100)}%</div>
+          <div style={{ fontSize: 8.5, color: T.faint }}>DOG WIN PROB</div>
+        </div>
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+        {g.signals.map((s, i) => (
+          <span key={i} style={{ fontSize: 11, color: T.sub, background: T.bg, border: `1px solid ${T.line}`, borderRadius: 5, padding: "3px 8px" }}>{s}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Track Record ---------------- */
+function TrackRecord({ engine }) {
+  const bt = engine.backtest || {};
+  const ens = bt.ensemble;
+  const curEns = engine.curBt?.ensemble;
+  const modelRows = MODELS.map((m) => ({ m, b: bt[m.key] }))
+    .filter((x) => x.b && x.b.total >= 25)
+    .map((x) => ({ ...x, acc: x.b.correct / x.b.total }))
+    .sort((a, b) => b.acc - a.acc);
+  const weeks = bt.byWeek ? Object.keys(bt.byWeek).map(Number).filter((w) => w <= 18).sort((a, b) => a - b) : [];
+  return (
+    <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ background: `linear-gradient(135deg, ${T.panel2}, ${T.panel})`, border: `1px solid ${T.border}`, borderRadius: 12, padding: "16px 18px" }}>
+        <span className="cond" style={{ fontSize: 13, letterSpacing: 0.6, color: T.gold, fontWeight: 700 }}>CONSENSUS BACKTEST · {engine.lastYear}</span>
+        {ens ? (
+          <div style={{ display: "flex", alignItems: "baseline", gap: 14, marginTop: 8, flexWrap: "wrap" }}>
+            <div className="cond tnum" style={{ fontSize: 42, fontWeight: 700, color: TIERS.lock.c, lineHeight: 1 }}>
+              {(ens.correct / ens.total * 100).toFixed(1)}<span style={{ fontSize: 20 }}>%</span>
+            </div>
+            <div className="tnum" style={{ color: T.sub, fontSize: 14 }}>{ens.correct}-{ens.total - ens.correct} straight up</div>
+          </div>
+        ) : <div style={{ color: T.sub, marginTop: 8, fontSize: 13 }}>Not enough history to backtest yet.</div>}
+        <div style={{ fontSize: 11, color: T.faint, marginTop: 8 }}>How the weighted consensus would have done last season, picking every game with only prior-week data.</div>
+        {curEns && curEns.total > 0 && (
+          <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.line}` }}>
+            <span className="cond" style={{ fontSize: 12, color: T.sub, fontWeight: 600 }}>THIS SEASON SO FAR</span>
+            <div className="tnum" style={{ fontSize: 15, marginTop: 4 }}>{curEns.correct}-{curEns.total - curEns.correct} · {(curEns.correct / curEns.total * 100).toFixed(1)}%</div>
+          </div>
+        )}
+      </div>
+
+      {modelRows.length > 0 && (
+        <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 16px" }}>
+          <div className="cond" style={{ fontSize: 13, letterSpacing: 0.5, color: T.sub, fontWeight: 600, marginBottom: 12 }}>MODEL-BY-MODEL ACCURACY</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {modelRows.map(({ m, acc }) => (
+              <div key={m.key}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: T.sub, marginBottom: 3 }}>
+                  <span>{m.label}</span><span className="tnum">{(acc * 100).toFixed(1)}%</span>
+                </div>
+                <div style={{ height: 5, background: T.line, borderRadius: 3, overflow: "hidden" }}>
+                  <div style={{ width: `${clamp((acc - 0.4) / 0.35 * 100, 3, 100)}%`, height: "100%", background: acc >= 0.6 ? TIERS.lock.c : acc >= 0.55 ? TIERS.lean.c : T.faint }} />
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 10.5, color: T.faint, marginTop: 10 }}>Higher-accuracy models carry more weight in the consensus vote.</div>
+        </div>
+      )}
+
+      {weeks.length > 0 && (
+        <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 16px" }}>
+          <div className="cond" style={{ fontSize: 13, letterSpacing: 0.5, color: T.sub, fontWeight: 600, marginBottom: 10 }}>CONSENSUS BY WEEK · {engine.lastYear}</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(64px,1fr))", gap: 8 }}>
+            {weeks.map((w) => {
+              const b = bt.byWeek[w]; const a = b.correct / b.total;
+              return (
+                <div key={w} style={{ background: T.bg, border: `1px solid ${T.line}`, borderRadius: 7, padding: "7px 4px", textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: T.faint }}>WK {w}</div>
+                  <div className="cond tnum" style={{ fontSize: 15, fontWeight: 600, color: a >= 0.65 ? TIERS.lock.c : a >= 0.5 ? T.text : TIERS.coin.c }}>{b.correct}-{b.total - b.correct}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- shared bits ---------------- */
+function Logo({ t, size }) {
+  const [ok, setOk] = useState(true);
+  if (!t?.logo || !ok) {
+    return (
+      <div style={{ width: size, height: size, borderRadius: size / 4, background: t?.color || T.faint, display: "grid", placeItems: "center", flexShrink: 0 }}>
+        <span className="cond" style={{ fontSize: size * 0.34, fontWeight: 700, color: "#fff" }}>{t?.abbr?.slice(0, 3)}</span>
+      </div>
+    );
+  }
+  return <img src={t.logo} alt={t.abbr} width={size} height={size} onError={() => setOk(false)} style={{ objectFit: "contain", flexShrink: 0 }} />;
+}
+
+function HowItWorks({ open, toggle, engine }) {
+  return (
+    <div style={{ marginTop: 22, borderTop: `1px solid ${T.line}`, paddingTop: 14 }}>
+      <button onClick={toggle} style={{ background: "transparent", border: "none", color: T.sub, display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+        <Info size={13} /> How the models work {open ? "▲" : "▼"}
+      </button>
+      {open && (
+        <div style={{ fontSize: 12.5, color: T.sub, lineHeight: 1.65, marginTop: 10, maxWidth: 640 }}>
+          <p><b style={{ color: T.text }}>Elo Rating</b> — margin-of-victory Elo (K=20, {HFA}-pt home edge), built from every {engine.lastYear} game, regressed toward the mean, then updated with this season&apos;s results.</p>
+          <p><b style={{ color: T.text }}>Vegas Line</b> — the market&apos;s implied win probability with the bookmaker&apos;s vig removed. Historically the sharpest single signal.</p>
+          <p><b style={{ color: T.text }}>ESPN FPI</b> — ESPN&apos;s own game projection pulled live per matchup.</p>
+          <p><b style={{ color: T.text }}>Net Rating</b> — average scoring margin adjusted for strength of schedule (opponent Elo).</p>
+          <p><b style={{ color: T.text }}>Pythagorean</b> — expected win rate from points scored vs. allowed. <b style={{ color: T.text }}>Form</b> — last four games. <b style={{ color: T.text }}>Win %</b> — raw record.</p>
+          <p style={{ color: T.faint }}>The <b>Consensus</b> blends every available model, weighting each by how it actually performed in last season&apos;s backtest. Games are then ranked by consensus confidence so your highest-confidence-pool points land on the safest picks. Early in the season, ratings lean on last year until this year&apos;s games accumulate. Predictions are probabilities, not certainties — respect the coin-flips.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- states ---------------- */
+function Loader({ prog }) {
+  const pct = Math.round((prog.done / Math.max(1, prog.total)) * 100);
+  return (
+    <div style={{ background: T.bg, minHeight: "100vh", color: T.text, display: "grid", placeItems: "center", fontFamily: "Inter, system-ui, sans-serif" }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@600;700&family=Inter:wght@400;500&display=swap');`}</style>
+      <div style={{ textAlign: "center", width: 300, padding: 20 }}>
+        <div className="cond" style={{ fontSize: 32, fontWeight: 700, letterSpacing: 1 }}>WAR <span style={{ color: T.gold }}>ROOM</span></div>
+        <div style={{ color: T.sub, fontSize: 13, margin: "10px 0 18px" }}>{prog.label}…</div>
+        <div style={{ height: 5, background: T.line, borderRadius: 3, overflow: "hidden" }}>
+          <div style={{ width: `${pct}%`, height: "100%", background: T.gold, transition: "width .2s" }} />
+        </div>
+        <div style={{ fontSize: 11, color: T.faint, marginTop: 8 }}>{prog.done}/{prog.total}</div>
+      </div>
+    </div>
+  );
+}
+function ErrorState({ msg, retry }) {
+  return (
+    <div style={{ background: T.bg, minHeight: "100vh", color: T.text, display: "grid", placeItems: "center", fontFamily: "Inter, system-ui, sans-serif", padding: 24 }}>
+      <div style={{ textAlign: "center", maxWidth: 420 }}>
+        <AlertTriangle size={30} color={TIERS.coin.c} />
+        <div className="cond" style={{ fontSize: 22, fontWeight: 700, marginTop: 12 }}>Couldn&apos;t reach the data</div>
+        <div style={{ color: T.sub, fontSize: 13, margin: "8px 0 16px" }}>{msg}</div>
+        <button onClick={retry} style={{ background: T.gold, color: "#111", border: "none", borderRadius: 8, padding: "9px 18px", fontWeight: 600, fontSize: 14 }}>Try again</button>
+      </div>
+    </div>
+  );
+}
+function Empty({ msg }) {
+  return <div style={{ marginTop: 30, textAlign: "center", color: T.sub, fontSize: 13, padding: 20 }}>{msg}</div>;
+}
+function WeekSkeleton() {
+  return (
+    <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+      {Array.from({ length: 6 }).map((_, i) => (
+        <div key={i} style={{ height: 56, background: T.panel, border: `1px solid ${T.line}`, borderRadius: 10, opacity: 1 - i * 0.12 }} />
+      ))}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
